@@ -11,6 +11,12 @@
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+// Max length for client_id header before we truncate in logs
+const MAX_CLIENT_ID_LOG_LEN = 128;
+
+// Paths exempt from client_id validation
+const EXEMPT_PATHS = ['/health'];
+
 // In-memory alert counter (swap for real alerting integration later)
 const alertCounters = { missing: 0, invalid: 0 };
 
@@ -27,12 +33,19 @@ function getAlertCounters() {
  * Emits a structured alert log.
  * Replace console.error with your alerting transport (e.g. PagerDuty, Slack webhook).
  */
+function truncate(str, max = MAX_CLIENT_ID_LOG_LEN) {
+  if (str && str.length > max) {
+    return str.slice(0, max) + `...[truncated, ${str.length} chars]`;
+  }
+  return str;
+}
+
 function emitAlert(type, detail, req) {
   const alert = {
     level: 'alert',
     code: 'F-002',
     type,
-    detail,
+    detail: truncate(detail),
     ip: req.ip,
     path: req.originalUrl,
     method: req.method,
@@ -43,8 +56,8 @@ function emitAlert(type, detail, req) {
 }
 
 function validateClientId(req, res, next) {
-  // Skip health endpoint
-  if (req.path === '/health') {
+  // Skip exempt paths (health, health sub-paths)
+  if (EXEMPT_PATHS.some((p) => req.path === p || req.path.startsWith(p + '/'))) {
     return next();
   }
 
@@ -74,4 +87,4 @@ function validateClientId(req, res, next) {
   next();
 }
 
-module.exports = { validateClientId, getAlertCounters, resetAlertCounters, UUID_RE };
+module.exports = { validateClientId, getAlertCounters, resetAlertCounters, UUID_RE, MAX_CLIENT_ID_LOG_LEN, EXEMPT_PATHS };

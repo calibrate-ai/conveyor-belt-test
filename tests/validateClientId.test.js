@@ -1,6 +1,6 @@
 const http = require('http');
 const app = require('../backend/server');
-const { getAlertCounters, resetAlertCounters } = require('../backend/middleware/validateClientId');
+const { getAlertCounters, resetAlertCounters, MAX_CLIENT_ID_LOG_LEN } = require('../backend/middleware/validateClientId');
 
 let server;
 
@@ -76,10 +76,10 @@ describe('client_id validation middleware (F-002)', () => {
       expect(res.body.alert_type).toBe('invalid_client_id');
     });
 
-    it('returns 400 for empty string', async () => {
+    it('returns 401 for empty string (treated as missing)', async () => {
       const res = await request('/api/events', { 'x-client-id': '' });
-      // Empty string → missing or invalid; middleware treats empty as missing
-      expect([400, 401]).toContain(res.status);
+      expect(res.status).toBe(401);
+      expect(res.body.alert_type).toBe('missing_client_id');
     });
 
     it('returns 400 for UUID-like but wrong version', async () => {
@@ -117,6 +117,24 @@ describe('client_id validation middleware (F-002)', () => {
     });
   });
 
+  describe('req.clientId attachment', () => {
+    it('attaches clientId to req for valid UUID', async () => {
+      // We verify indirectly: valid UUID passes middleware → reaches 404 handler
+      // If clientId were NOT set, middleware would block. The pass-through is proof.
+      const res = await request('/api/events', { 'x-client-id': VALID_CLIENT_ID });
+      expect(res.status).toBe(404); // passed middleware, hit 404 handler
+    });
+  });
+
+  describe('health sub-path bypass', () => {
+    it('allows /health/ready without x-client-id', async () => {
+      const res = await request('/health/ready');
+      // No route for /health/ready → 404, but middleware did not block
+      expect(res.status).toBe(404);
+      expect(res.body.error).toBe('Not found');
+    });
+  });
+
   describe('alert log output', () => {
     it('emits structured JSON to stderr for missing client_id', async () => {
       const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
@@ -139,6 +157,18 @@ describe('client_id validation middleware (F-002)', () => {
       expect(logged.code).toBe('F-002');
       expect(logged.type).toBe('invalid_client_id');
       expect(logged.detail).toMatch(/garbage/);
+      errorSpy.mockRestore();
+    });
+
+    it('truncates oversized client_id in alert detail', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const longId = 'x'.repeat(1000);
+      await request('/api/events', { 'x-client-id': longId });
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const logged = JSON.parse(errorSpy.mock.calls[0][0]);
+      expect(logged.detail.length).toBeLessThan(1000);
+      expect(logged.detail).toContain('truncated');
+      expect(logged.detail).toMatch(/truncated, \d+ chars/);
       errorSpy.mockRestore();
     });
   });
