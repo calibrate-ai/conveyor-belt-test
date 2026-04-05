@@ -1,9 +1,13 @@
 const express = require('express');
+const { validateClientId } = require('./middleware/validateClientId');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.disable('x-powered-by');
+
+// client_id validation — skips /health internally
+app.use(validateClientId);
 
 app.get('/health', (_req, res) => {
   res.json({
