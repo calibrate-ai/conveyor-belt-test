@@ -1,0 +1,3 @@
+# Frontend
+
+Simple React component.
