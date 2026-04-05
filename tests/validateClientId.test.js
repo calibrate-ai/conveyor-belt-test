@@ -1,6 +1,6 @@
 const http = require('http');
 const app = require('../backend/server');
-const { getAlertCounters, resetAlertCounters, MAX_CLIENT_ID_LOG_LEN } = require('../backend/middleware/validateClientId');
+const { getAlertCounters, resetAlertCounters, sanitizeForLog, MAX_CLIENT_ID_LOG_LEN } = require('../backend/middleware/validateClientId');
 
 let server;
 
@@ -76,9 +76,10 @@ describe('client_id validation middleware (F-002)', () => {
       expect(res.body.alert_type).toBe('invalid_client_id');
     });
 
-    it('returns 401 for empty string (treated as missing)', async () => {
+    it('returns 401 for empty string (falsy — treated as missing)', async () => {
       const res = await request('/api/events', { 'x-client-id': '' });
       expect(res.status).toBe(401);
+      expect(res.body.error).toMatch(/Missing x-client-id/);
       expect(res.body.alert_type).toBe('missing_client_id');
     });
 
@@ -170,6 +171,22 @@ describe('client_id validation middleware (F-002)', () => {
       expect(logged.detail).toContain('truncated');
       expect(logged.detail).toMatch(/truncated, \d+ chars/);
       errorSpy.mockRestore();
+    });
+
+    it('sanitizeForLog strips newlines to prevent log injection', () => {
+      const malicious = 'evil\n{"level":"alert","spoofed":true}\r\nmore';
+      const result = sanitizeForLog(malicious);
+      expect(result).not.toMatch(/[\n\r]/);
+      expect(result).toContain('evil');
+      expect(result).toContain('more');
+    });
+
+    it('sanitizeForLog truncates and strips newlines from long input', () => {
+      const long = 'a\nb'.repeat(500);
+      const result = sanitizeForLog(long, 100);
+      expect(result).not.toMatch(/[\n\r]/);
+      expect(result.length).toBeLessThan(long.length);
+      expect(result).toContain('truncated');
     });
   });
 });

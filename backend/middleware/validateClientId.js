@@ -6,7 +6,7 @@
  * - Invalid format  → 400 + alert
  * - Valid           → attaches req.clientId and continues
  *
- * Valid client_id: UUID v4 format (lowercase hex + hyphens).
+ * Valid client_id: UUID v4 format (hex + hyphens, case-insensitive).
  */
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -30,22 +30,36 @@ function getAlertCounters() {
 }
 
 /**
- * Emits a structured alert log.
- * Replace console.error with your alerting transport (e.g. PagerDuty, Slack webhook).
+ * Sanitize user input for safe log inclusion:
+ * - Strip newlines/carriage returns to prevent log injection
+ * - Truncate to max length
  */
-function truncate(str, max = MAX_CLIENT_ID_LOG_LEN) {
-  if (str && str.length > max) {
-    return str.slice(0, max) + `...[truncated, ${str.length} chars]`;
+function sanitizeForLog(str, max = MAX_CLIENT_ID_LOG_LEN) {
+  if (!str) return str;
+  const clean = str.replace(/[\n\r]/g, '');
+  if (clean.length > max) {
+    return clean.slice(0, max) + `...[truncated, ${str.length} chars]`;
   }
-  return str;
+  return clean;
 }
 
+/**
+ * Emits a structured alert log.
+ * Replace console.error with your alerting transport (e.g. PagerDuty, Slack webhook).
+ *
+ * NOTE: req.ip returns the socket address by default. If behind a reverse proxy
+ * (HAProxy, nginx, ALB), configure `app.set('trust proxy', ...)` so req.ip
+ * reflects the real client IP via X-Forwarded-For.
+ *
+ * TODO: Add sliding-window rate limiting to suppress alert floods
+ * (e.g. max 100 alerts per 60s per type, then suppress with a summary).
+ */
 function emitAlert(type, detail, req) {
   const alert = {
     level: 'alert',
     code: 'F-002',
     type,
-    detail: truncate(detail),
+    detail: sanitizeForLog(detail),
     ip: req.ip,
     path: req.originalUrl,
     method: req.method,
@@ -75,7 +89,8 @@ function validateClientId(req, res, next) {
 
   if (!UUID_RE.test(clientId)) {
     alertCounters.invalid++;
-    const alert = emitAlert('invalid_client_id', `Invalid client_id format: ${clientId}`, req);
+    const safeId = clientId.slice(0, MAX_CLIENT_ID_LOG_LEN).replace(/[\n\r]/g, '');
+    const alert = emitAlert('invalid_client_id', `Invalid client_id format: ${safeId}`, req);
     return res.status(400).json({
       error: 'Invalid x-client-id format — expected UUID v4',
       code: 'F-002',
@@ -87,4 +102,4 @@ function validateClientId(req, res, next) {
   next();
 }
 
-module.exports = { validateClientId, getAlertCounters, resetAlertCounters, UUID_RE, MAX_CLIENT_ID_LOG_LEN, EXEMPT_PATHS };
+module.exports = { validateClientId, getAlertCounters, resetAlertCounters, sanitizeForLog, UUID_RE, MAX_CLIENT_ID_LOG_LEN, EXEMPT_PATHS };
