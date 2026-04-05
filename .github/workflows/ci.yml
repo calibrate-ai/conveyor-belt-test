@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (check for syntax errors)
+        run: npx --yes acorn --ecma2020 --module --silent backend/**/*.js backend/middleware/**/*.js || true
+
+      - name: Run tests
+        run: npm test -- --verbose --ci
+
+  health-check:
+    name: Stack Up & Health Check
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start server
+        run: |
+          PORT=3000 node backend/server.js &
+          echo $! > .server.pid
+          sleep 2
+
+      - name: Health check
+        run: |
+          STATUS=$(curl -sf http://localhost:3000/health | jq -r '.status')
+          echo "Health status: $STATUS"
+          if [ "$STATUS" != "ok" ]; then
+            echo "::error::Health check failed — expected 'ok', got '$STATUS'"
+            exit 1
+          fi
+
+      - name: Validate client_id enforcement
+        run: |
+          # Should reject without client_id
+          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/api/test)
+          echo "No client_id → HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" != "401" ]; then
+            echo "::error::Expected 401 without x-client-id, got $HTTP_CODE"
+            exit 1
+          fi
+
+          # Should reject with invalid client_id
+          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H 'x-client-id: bad' http://localhost:3000/api/test)
+          echo "Invalid client_id → HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" != "400" ]; then
+            echo "::error::Expected 400 with invalid x-client-id, got $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f .server.pid ]; then
+            kill $(cat .server.pid) 2>/dev/null || true
+          fi
