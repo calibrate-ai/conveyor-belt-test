@@ -10,6 +10,7 @@ jobs:
   lint-and-test:
     name: Lint & Test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -25,7 +26,7 @@ jobs:
         run: npm ci
 
       - name: Lint (check for syntax errors)
-        run: npx --yes acorn --ecma2020 --module --silent backend/**/*.js backend/middleware/**/*.js || true
+        run: npx acorn --ecma2020 --module --silent backend/**/*.js backend/middleware/**/*.js
 
       - name: Run tests
         run: npm test -- --verbose --ci
@@ -33,6 +34,7 @@ jobs:
   health-check:
     name: Stack Up & Health Check
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: lint-and-test
 
     steps:
@@ -52,7 +54,18 @@ jobs:
         run: |
           PORT=3000 node backend/server.js &
           echo $! > .server.pid
-          sleep 2
+
+      - name: Wait for server readiness
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+              echo "Server ready after ~${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Server failed to become ready within 30s"
+          exit 1
 
       - name: Health check
         run: |
