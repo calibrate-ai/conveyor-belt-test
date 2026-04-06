@@ -4,20 +4,22 @@
  * Returns cost aggregates scoped by client_id.
  *
  * Query params:
- *   client_id   (required) — UUID v4, tenant identifier
  *   model       (optional) — filter by model name
  *   start_ts    (optional) — ISO 8601, defaults to 24h ago
  *   end_ts      (optional) — ISO 8601, defaults to now
  *   granularity (optional) — hour|day|week, defaults to hour
+ *   limit       (optional) — max rows, defaults to 1000, max 10000
  *
- * In production, client_id will come from the validated middleware
- * (req.clientId). For now, it's accepted as a query parameter.
+ * client_id comes from the validated middleware (req.clientId).
+ * It is NOT accepted as a query parameter — tenant isolation is enforced
+ * by the middleware, not by the caller.
+ *
+ * NOTE: This route is not yet mounted in server.js. It will be wired up
+ * once the DB pool is configured (requires pg + TimescaleDB connection).
+ * See backend/db/config.js for connection setup.
  */
 
-const express = require('express');
 const { validateParams, buildQuery } = require('../queries/costAggregates');
-
-const router = express.Router();
 
 /**
  * Execute the cost query against the database.
@@ -25,8 +27,15 @@ const router = express.Router();
  */
 function createHandler(dbPool) {
   return async (req, res) => {
-    // In production, prefer req.clientId from middleware over query param
-    const clientId = req.clientId || req.query.client_id;
+    // client_id MUST come from validated middleware — never from query params.
+    // This ensures tenant isolation cannot be bypassed by the caller.
+    const clientId = req.clientId;
+
+    if (!clientId) {
+      return res.status(401).json({
+        error: 'Missing client identity — x-client-id header required',
+      });
+    }
 
     const validation = validateParams({
       ...req.query,
@@ -53,6 +62,7 @@ function createHandler(dbPool) {
           start_ts: validation.params.startTs.toISOString(),
           end_ts: validation.params.endTs.toISOString(),
           model: validation.params.model,
+          limit: validation.params.limit,
           count: result.rows.length,
         },
       });
@@ -67,10 +77,11 @@ function createHandler(dbPool) {
 
 /**
  * Mount the usage costs route.
+ * @param {object} app — Express app instance
  * @param {object} dbPool — pg Pool instance for database queries
  */
 function mount(app, dbPool) {
   app.get('/api/v1/usage/costs', createHandler(dbPool));
 }
 
-module.exports = { mount, createHandler, router };
+module.exports = { mount, createHandler };

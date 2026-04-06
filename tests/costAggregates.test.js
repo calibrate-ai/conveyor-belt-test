@@ -1,4 +1,4 @@
-const { validateParams, buildQuery, VALID_GRANULARITIES } = require('../backend/queries/costAggregates');
+const { validateParams, buildQuery, VALID_GRANULARITIES, DEFAULT_LIMIT, MAX_LIMIT } = require('../backend/queries/costAggregates');
 
 const VALID_UUID = '550e8400-e29b-41d4-a716-446655440000';
 
@@ -12,6 +12,7 @@ describe('costAggregates query builder', () => {
       expect(result.params.startTs).toBeInstanceOf(Date);
       expect(result.params.endTs).toBeInstanceOf(Date);
       expect(result.params.model).toBeNull();
+      expect(result.params.limit).toBe(DEFAULT_LIMIT);
     });
 
     it('normalizes client_id to lowercase', () => {
@@ -97,6 +98,30 @@ describe('costAggregates query builder', () => {
       expect(result.valid).toBe(false);
       expect(result.errors.length).toBeGreaterThan(1);
     });
+
+    it('accepts custom limit', () => {
+      const result = validateParams({ client_id: VALID_UUID, limit: '500' });
+      expect(result.valid).toBe(true);
+      expect(result.params.limit).toBe(500);
+    });
+
+    it('caps limit at MAX_LIMIT', () => {
+      const result = validateParams({ client_id: VALID_UUID, limit: '99999' });
+      expect(result.valid).toBe(true);
+      expect(result.params.limit).toBe(MAX_LIMIT);
+    });
+
+    it('rejects non-positive limit', () => {
+      const result = validateParams({ client_id: VALID_UUID, limit: '0' });
+      expect(result.valid).toBe(false);
+      expect(result.errors[0]).toMatch(/limit/);
+    });
+
+    it('rejects non-numeric limit', () => {
+      const result = validateParams({ client_id: VALID_UUID, limit: 'abc' });
+      expect(result.valid).toBe(false);
+      expect(result.errors[0]).toMatch(/limit/);
+    });
   });
 
   describe('buildQuery', () => {
@@ -106,6 +131,7 @@ describe('costAggregates query builder', () => {
       startTs: new Date('2026-04-01T00:00:00Z'),
       endTs: new Date('2026-04-02T00:00:00Z'),
       model: null,
+      limit: 1000,
     };
 
     it('builds a parameterized query for hour granularity', () => {
@@ -114,39 +140,53 @@ describe('costAggregates query builder', () => {
       expect(sql).toContain('$1');
       expect(sql).toContain('$2');
       expect(sql).toContain('$3');
-      expect(values).toEqual([VALID_UUID, '2026-04-01T00:00:00.000Z', '2026-04-02T00:00:00.000Z']);
+      expect(values[0]).toBe(VALID_UUID);
+      expect(values[1]).toBe('2026-04-01T00:00:00.000Z');
+      expect(values[2]).toBe('2026-04-02T00:00:00.000Z');
     });
 
     it('reads directly from continuous aggregate for hour granularity', () => {
       const { sql } = buildQuery(baseParams);
       expect(sql).toContain('FROM cost_rollup_hourly');
-      expect(sql).not.toContain('GROUP BY'); // direct read, no re-bucketing
+      expect(sql).not.toContain('GROUP BY');
     });
 
-    it('re-buckets for day granularity', () => {
-      const { sql } = buildQuery({ ...baseParams, granularity: 'day' });
-      expect(sql).toContain("time_bucket('1 day'");
+    it('re-buckets for day granularity with parameterized interval', () => {
+      const { sql, values } = buildQuery({ ...baseParams, granularity: 'day' });
+      expect(sql).toMatch(/time_bucket\(\$\d+::interval/);
       expect(sql).toContain('GROUP BY');
       expect(sql).toContain('SUM(');
+      expect(values).toContain('1 day');
     });
 
-    it('re-buckets for week granularity', () => {
-      const { sql } = buildQuery({ ...baseParams, granularity: 'week' });
-      expect(sql).toContain("time_bucket('1 week'");
+    it('re-buckets for week granularity with parameterized interval', () => {
+      const { sql, values } = buildQuery({ ...baseParams, granularity: 'week' });
+      expect(sql).toMatch(/time_bucket\(\$\d+::interval/);
       expect(sql).toContain('GROUP BY');
+      expect(values).toContain('1 week');
+    });
+
+    it('does NOT interpolate interval as string literal', () => {
+      const { sql } = buildQuery({ ...baseParams, granularity: 'day' });
+      // Should not contain interval as a quoted string in SQL
+      expect(sql).not.toMatch(/time_bucket\('1 day'/);
     });
 
     it('adds model filter when specified', () => {
       const { sql, values } = buildQuery({ ...baseParams, model: 'gpt-4' });
-      expect(sql).toContain('AND model = $4');
+      expect(sql).toMatch(/AND model = \$\d/);
       expect(values).toContain('gpt-4');
-      expect(values.length).toBe(4);
     });
 
     it('does not add model filter when null', () => {
-      const { sql, values } = buildQuery(baseParams);
+      const { sql } = buildQuery(baseParams);
       expect(sql).not.toContain('AND model =');
-      expect(values.length).toBe(3);
+    });
+
+    it('includes LIMIT clause', () => {
+      const { sql, values } = buildQuery(baseParams);
+      expect(sql).toMatch(/LIMIT \$\d/);
+      expect(values).toContain(1000);
     });
 
     it('orders results by period DESC', () => {
@@ -173,7 +213,6 @@ describe('costAggregates query builder', () => {
         clientId: "'; DROP TABLE requests; --",
       };
       const { sql, values } = buildQuery(malicious);
-      // The malicious string should be in values, not interpolated in SQL
       expect(sql).not.toContain('DROP TABLE');
       expect(values[0]).toContain('DROP TABLE');
     });

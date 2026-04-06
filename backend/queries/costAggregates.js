@@ -2,10 +2,11 @@
  * Cost aggregate query builder for /api/v1/usage/costs
  *
  * Builds parameterized SQL queries against the cost_rollup_hourly
- * continuous aggregate (or falls back to the requests hypertable
- * for sub-hour granularity).
+ * continuous aggregate.
  *
  * All queries are scoped by client_id (tenant isolation).
+ * All dynamic values — including time_bucket interval — are parameterized
+ * for defense in depth.
  */
 
 const VALID_GRANULARITIES = ['hour', 'day', 'week'];
@@ -16,6 +17,10 @@ const GRANULARITY_INTERVALS = {
   week: '1 week',
 };
 
+// Default and max result limits to prevent accidental full-table dumps
+const DEFAULT_LIMIT = 1000;
+const MAX_LIMIT = 10000;
+
 /**
  * Validate and parse query parameters for cost aggregates.
  * Returns { valid: true, params } or { valid: false, error }.
@@ -23,7 +28,7 @@ const GRANULARITY_INTERVALS = {
 function validateParams(query) {
   const errors = [];
 
-  // client_id is required (comes from middleware in production)
+  // client_id is required (comes from validated middleware in production)
   if (!query.client_id) {
     errors.push('client_id is required');
   }
@@ -66,6 +71,18 @@ function validateParams(query) {
   // Model filter (optional)
   const model = query.model || null;
 
+  // Limit (optional, for pagination)
+  let limit = DEFAULT_LIMIT;
+  if (query.limit !== undefined) {
+    limit = parseInt(query.limit, 10);
+    if (isNaN(limit) || limit < 1) {
+      errors.push('limit must be a positive integer');
+      limit = DEFAULT_LIMIT;
+    } else if (limit > MAX_LIMIT) {
+      limit = MAX_LIMIT;
+    }
+  }
+
   if (errors.length > 0) {
     return { valid: false, errors };
   }
@@ -78,6 +95,7 @@ function validateParams(query) {
       startTs,
       endTs,
       model,
+      limit,
     },
   };
 }
@@ -89,27 +107,28 @@ function validateParams(query) {
  * Returns { sql, values } for use with pg client.query().
  */
 function buildQuery(params) {
-  const { clientId, granularity, startTs, endTs, model } = params;
+  const { clientId, granularity, startTs, endTs, model, limit } = params;
   const interval = GRANULARITY_INTERVALS[granularity];
 
-  // For hour granularity, read directly from the continuous aggregate
-  // For day/week, re-bucket the hourly aggregate
-  const source = 'cost_rollup_hourly';
-
+  // Build values array: $1=client_id, $2=start, $3=end, then optional model, then limit
+  // For day/week: interval is added as a parameter too
   const values = [clientId, startTs.toISOString(), endTs.toISOString()];
-  let paramIdx = 4;
+  let nextIdx = 4;
 
   let modelFilter = '';
   if (model) {
-    modelFilter = `AND model = $${paramIdx}`;
+    modelFilter = `AND model = $${nextIdx}`;
     values.push(model);
-    paramIdx++;
+    nextIdx++;
   }
 
   let sql;
 
   if (granularity === 'hour') {
-    // Direct read from hourly aggregate
+    // Direct read from hourly continuous aggregate — no re-bucketing needed
+    const limitIdx = nextIdx;
+    values.push(limit || DEFAULT_LIMIT);
+
     sql = `
       SELECT
         bucket AS period,
@@ -123,18 +142,26 @@ function buildQuery(params) {
         total_tokens,
         avg_latency_ms,
         error_count
-      FROM ${source}
+      FROM cost_rollup_hourly
       WHERE client_id = $1
         AND bucket >= $2
         AND bucket < $3
         ${modelFilter}
       ORDER BY bucket DESC, model ASC
+      LIMIT $${limitIdx}
     `;
   } else {
-    // Re-bucket for day/week
+    // Re-bucket for day/week — interval parameterized for defense in depth
+    const intervalIdx = nextIdx;
+    values.push(interval);
+    nextIdx++;
+
+    const limitIdx = nextIdx;
+    values.push(limit || DEFAULT_LIMIT);
+
     sql = `
       SELECT
-        time_bucket('${interval}', bucket) AS period,
+        time_bucket($${intervalIdx}::interval, bucket) AS period,
         client_id,
         model,
         provider,
@@ -145,13 +172,14 @@ function buildQuery(params) {
         SUM(total_tokens)::bigint AS total_tokens,
         AVG(avg_latency_ms) AS avg_latency_ms,
         SUM(error_count)::bigint AS error_count
-      FROM ${source}
+      FROM cost_rollup_hourly
       WHERE client_id = $1
         AND bucket >= $2
         AND bucket < $3
         ${modelFilter}
       GROUP BY period, client_id, model, provider
       ORDER BY period DESC, model ASC
+      LIMIT $${limitIdx}
     `;
   }
 
@@ -163,4 +191,6 @@ module.exports = {
   buildQuery,
   VALID_GRANULARITIES,
   GRANULARITY_INTERVALS,
+  DEFAULT_LIMIT,
+  MAX_LIMIT,
 };
