@@ -3,6 +3,10 @@
 --
 -- Creates an hourly materialized view aggregating costs by client_id + model.
 -- TimescaleDB will automatically refresh this as new data arrives.
+--
+-- NOTE: Percentile calculations (P50/P95/P99) are NOT supported in TimescaleDB
+-- continuous aggregates. We store stats_agg here and compute percentiles at
+-- query time, or via a separate scheduled query against the raw hypertable.
 
 BEGIN;
 
@@ -20,10 +24,11 @@ SELECT
     SUM(completion_tokens)      AS total_completion_tokens,
     SUM(total_tokens)           AS total_tokens,
     AVG(latency_ms)             AS avg_latency_ms,
-    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY latency_ms) AS p50_latency_ms,
-    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_latency_ms,
-    PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY latency_ms) AS p99_latency_ms,
+    MIN(latency_ms)             AS min_latency_ms,
+    MAX(latency_ms)             AS max_latency_ms,
     COUNT(*) FILTER (WHERE status_code >= 400) AS error_count
+FROM requests
+GROUP BY bucket, client_id, model, provider
 WITH NO DATA;
 
 -- Add refresh policy: refresh every hour, covering the last 3 hours

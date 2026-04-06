@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS requests (
     latency_ms      INTEGER         NOT NULL DEFAULT 0,
     status_code     SMALLINT        NOT NULL DEFAULT 200,
     error_code      TEXT,
+    -- request_hash: SHA-256 of the normalized prompt, used for cache-hit
+    -- simulation (E6) and deduplication detection. NULL when not computed.
     request_hash    TEXT,
     metadata        JSONB,
 
@@ -54,5 +56,13 @@ CREATE INDEX IF NOT EXISTS idx_requests_status_code_ts
 CREATE INDEX IF NOT EXISTS idx_requests_request_hash
     ON requests (request_hash)
     WHERE request_hash IS NOT NULL;
+
+-- Retention policy: drop chunks older than 90 days.
+-- Adjust via ALTER policy or env-driven config as needed.
+SELECT add_retention_policy(
+    'requests',
+    INTERVAL '90 days',
+    if_not_exists => TRUE
+);
 
 COMMIT;

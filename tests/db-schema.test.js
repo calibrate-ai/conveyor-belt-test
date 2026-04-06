@@ -28,7 +28,6 @@ describe('Database schema migrations', () => {
     migrationFiles.forEach((file) => {
       const content = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
       expect(content.length).toBeGreaterThan(0);
-      // Basic SQL sanity: should contain at least one statement
       expect(content).toMatch(/\b(CREATE|ALTER|INSERT|SELECT|BEGIN|DROP)\b/i);
     });
   });
@@ -88,6 +87,15 @@ describe('Database schema migrations', () => {
     it('uses IF NOT EXISTS for idempotency', () => {
       expect(sql).toMatch(/IF NOT EXISTS/gi);
     });
+
+    it('documents request_hash purpose', () => {
+      expect(sql).toMatch(/request_hash.*cache|dedup/is);
+    });
+
+    it('includes a retention policy', () => {
+      expect(sql).toMatch(/add_retention_policy/i);
+      expect(sql).toMatch(/90 days/i);
+    });
   });
 
   describe('002_create_cost_rollup_view.sql', () => {
@@ -111,18 +119,33 @@ describe('Database schema migrations', () => {
       expect(sql).toMatch(/model/);
     });
 
+    it('has a GROUP BY clause', () => {
+      expect(sql).toMatch(/GROUP BY\s+bucket,\s*client_id,\s*model,\s*provider/i);
+    });
+
     it('aggregates cost_usd', () => {
       expect(sql).toMatch(/SUM\(cost_usd\)/i);
     });
 
-    it('includes latency percentiles', () => {
-      expect(sql).toMatch(/PERCENTILE_CONT\(0\.50\)/i);
-      expect(sql).toMatch(/PERCENTILE_CONT\(0\.95\)/i);
-      expect(sql).toMatch(/PERCENTILE_CONT\(0\.99\)/i);
+    it('does NOT use PERCENTILE_CONT (unsupported in continuous aggregates)', () => {
+      expect(sql).not.toMatch(/PERCENTILE_CONT/i);
+    });
+
+    it('includes min/max latency as continuous-aggregate-safe alternatives', () => {
+      expect(sql).toMatch(/MIN\(latency_ms\)/i);
+      expect(sql).toMatch(/MAX\(latency_ms\)/i);
+    });
+
+    it('documents percentile limitation', () => {
+      expect(sql).toMatch(/percentile.*not supported|not.*supported.*continuous/is);
     });
 
     it('includes error count', () => {
       expect(sql).toMatch(/FILTER.*WHERE status_code >= 400/i);
+    });
+
+    it('selects FROM requests', () => {
+      expect(sql).toMatch(/FROM\s+requests/i);
     });
 
     it('sets up continuous aggregate refresh policy', () => {
@@ -150,12 +173,10 @@ describe('Database schema migrations', () => {
     });
 
     it('does not hardcode a password', () => {
-      // DB_PASSWORD should come from env — no default
       const configSource = fs.readFileSync(
         path.join(__dirname, '..', 'backend', 'db', 'config.js'),
         'utf8'
       );
-      // Should NOT have a string default for password
       expect(configSource).not.toMatch(/password.*['"][^'"]+['"]/);
     });
 
@@ -163,6 +184,34 @@ describe('Database schema migrations', () => {
       expect(dbConfig.pool).toBeDefined();
       expect(dbConfig.pool.min).toBeGreaterThan(0);
       expect(dbConfig.pool.max).toBeGreaterThan(dbConfig.pool.min);
+    });
+
+    it('defaults SSL to secure (rejectUnauthorized: true)', () => {
+      const configSource = fs.readFileSync(
+        path.join(__dirname, '..', 'backend', 'db', 'config.js'),
+        'utf8'
+      );
+      // Should NOT default to rejectUnauthorized: false
+      expect(configSource).not.toMatch(/rejectUnauthorized:\s*false(?!\s*['"])/);
+    });
+  });
+
+  describe('rollback documentation', () => {
+    it('ROLLBACK.md exists with rollback instructions', () => {
+      const rollbackPath = path.join(__dirname, '..', 'backend', 'db', 'ROLLBACK.md');
+      expect(fs.existsSync(rollbackPath)).toBe(true);
+      const content = fs.readFileSync(rollbackPath, 'utf8');
+      expect(content).toMatch(/rollback/i);
+      expect(content).toMatch(/DROP/i);
+    });
+  });
+
+  describe('pg dependency', () => {
+    it('pg is declared in package.json dependencies', () => {
+      const pkg = JSON.parse(
+        fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')
+      );
+      expect(pkg.dependencies).toHaveProperty('pg');
     });
   });
 });
