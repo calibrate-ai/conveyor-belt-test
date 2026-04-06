@@ -7,6 +7,13 @@
  *
  * Fail-open: never blocks or delays the response to the client.
  * Cost calculation happens after the response is sent.
+ *
+ * LIMITATION: This middleware patches res.json() to capture the response body.
+ * It will NOT capture responses sent via res.send(), res.end(), or streaming.
+ * If another middleware also patches res.json, the behavior depends on
+ * middleware ordering. For v1 this covers all LiteLLM completion responses
+ * (which are always JSON). If streaming support is needed, consider
+ * res.on('finish', ...) with a separate body capture strategy.
  */
 
 const { calculateCost } = require('../lib/pricing');

@@ -29,9 +29,13 @@ const MODEL_PRICING = {
 // Default fallback pricing when model is unknown
 const DEFAULT_PRICING = { prompt: 0.00001, completion: 0.00003 };
 
+// Pre-sort keys by length descending for correct prefix matching.
+// Ensures "gpt-4o-mini" matches before "gpt-4o" or "gpt-4".
+const SORTED_MODEL_KEYS = Object.keys(MODEL_PRICING).sort((a, b) => b.length - a.length);
+
 /**
  * Calculate cost in USD for a given model + token counts.
- * Falls back to default pricing for unknown models.
+ * Falls back to default pricing for unknown models (with a warning log).
  *
  * @param {string} model - Model name
  * @param {number} promptTokens - Number of prompt tokens
@@ -39,13 +43,13 @@ const DEFAULT_PRICING = { prompt: 0.00001, completion: 0.00003 };
  * @returns {{ costUsd: number, pricingSource: string }}
  */
 function calculateCost(model, promptTokens, completionTokens) {
-  // Try exact match first, then prefix match (e.g. "gpt-4-0613" → "gpt-4")
+  // Try exact match first
   let pricing = MODEL_PRICING[model];
   let source = 'exact';
 
   if (!pricing) {
-    // Try prefix matching
-    const prefix = Object.keys(MODEL_PRICING).find((key) => model.startsWith(key));
+    // Prefix match — sorted longest-first for specificity
+    const prefix = SORTED_MODEL_KEYS.find((key) => model.startsWith(key));
     if (prefix) {
       pricing = MODEL_PRICING[prefix];
       source = `prefix:${prefix}`;
@@ -55,6 +59,8 @@ function calculateCost(model, promptTokens, completionTokens) {
   if (!pricing) {
     pricing = DEFAULT_PRICING;
     source = 'default';
+    // Warn operators so they know the pricing table needs updating
+    console.warn(`[pricing] Unknown model "${model}" — using default pricing. Add to MODEL_PRICING.`);
   }
 
   const costUsd = (promptTokens * pricing.prompt) + (completionTokens * pricing.completion);
@@ -65,4 +71,4 @@ function calculateCost(model, promptTokens, completionTokens) {
   };
 }
 
-module.exports = { calculateCost, MODEL_PRICING, DEFAULT_PRICING };
+module.exports = { calculateCost, MODEL_PRICING, DEFAULT_PRICING, SORTED_MODEL_KEYS };

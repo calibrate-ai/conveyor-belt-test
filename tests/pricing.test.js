@@ -1,6 +1,14 @@
-const { calculateCost, MODEL_PRICING, DEFAULT_PRICING } = require('../backend/lib/pricing');
+const { calculateCost, MODEL_PRICING, DEFAULT_PRICING, SORTED_MODEL_KEYS } = require('../backend/lib/pricing');
 
 describe('pricing', () => {
+  describe('SORTED_MODEL_KEYS', () => {
+    it('is sorted by length descending (longest first)', () => {
+      for (let i = 1; i < SORTED_MODEL_KEYS.length; i++) {
+        expect(SORTED_MODEL_KEYS[i - 1].length).toBeGreaterThanOrEqual(SORTED_MODEL_KEYS[i].length);
+      }
+    });
+  });
+
   describe('calculateCost', () => {
     it('calculates cost for known model (gpt-4)', () => {
       const result = calculateCost('gpt-4', 1000, 500);
@@ -29,11 +37,43 @@ describe('pricing', () => {
       expect(result.costUsd).toBeCloseTo(expected, 6);
     });
 
+    it('matches most specific prefix (gpt-4o-mini-2026 → gpt-4o-mini, not gpt-4)', () => {
+      const result = calculateCost('gpt-4o-mini-2026', 1000, 500);
+      expect(result.pricingSource).toBe('prefix:gpt-4o-mini');
+      // Should use gpt-4o-mini pricing, NOT gpt-4
+      const expected = (1000 * 0.00000015) + (500 * 0.0000006);
+      expect(result.costUsd).toBeCloseTo(expected, 6);
+    });
+
+    it('matches gpt-4o prefix correctly (not gpt-4)', () => {
+      const result = calculateCost('gpt-4o-2026-01', 1000, 500);
+      expect(result.pricingSource).toBe('prefix:gpt-4o');
+      const expected = (1000 * 0.000005) + (500 * 0.000015);
+      expect(result.costUsd).toBeCloseTo(expected, 6);
+    });
+
     it('falls back to default pricing for unknown model', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       const result = calculateCost('some-new-model', 1000, 500);
       expect(result.pricingSource).toBe('default');
       const expected = (1000 * DEFAULT_PRICING.prompt) + (500 * DEFAULT_PRICING.completion);
       expect(result.costUsd).toBeCloseTo(expected, 6);
+      warnSpy.mockRestore();
+    });
+
+    it('logs a warning when falling back to default pricing', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      calculateCost('totally-unknown-model', 100, 50);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy.mock.calls[0][0]).toMatch(/Unknown model.*totally-unknown-model/);
+      warnSpy.mockRestore();
+    });
+
+    it('does NOT log a warning for known models', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      calculateCost('gpt-4', 100, 50);
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
     });
 
     it('returns 0 for zero tokens', () => {

@@ -1,4 +1,6 @@
-const { extractUsage, buildEvent } = require('../backend/middleware/costCapture');
+const http = require('http');
+const express = require('express');
+const { createCostCapture, extractUsage, buildEvent } = require('../backend/middleware/costCapture');
 
 describe('costCapture middleware', () => {
   describe('extractUsage', () => {
@@ -115,6 +117,91 @@ describe('costCapture middleware', () => {
       const event = buildEvent(mockReq, mockRes, usage, costResult, 100);
       const ts = new Date(event.ts);
       expect(ts.toISOString()).toBe(event.ts);
+    });
+  });
+
+  describe('createCostCapture (integration)', () => {
+    let server;
+
+    afterEach((done) => {
+      if (server) server.close(done);
+      else done();
+    });
+
+    function request(srv, path) {
+      const { port } = srv.address();
+      return new Promise((resolve, reject) => {
+        http.get(`http://127.0.0.1:${port}${path}`, (res) => {
+          let data = '';
+          res.on('data', (chunk) => { data += chunk; });
+          res.on('end', () => {
+            resolve({ status: res.statusCode, body: JSON.parse(data) });
+          });
+        }).on('error', reject);
+      });
+    }
+
+    function wait(ms) {
+      return new Promise((r) => setTimeout(r, ms));
+    }
+
+    it('calls emitter.emit when response contains usage data', async () => {
+      const mockEmitter = { emit: jest.fn().mockResolvedValue(true) };
+      const app = express();
+      app.use(createCostCapture(mockEmitter));
+      app.get('/test', (_req, res) => {
+        res.json({
+          id: 'chatcmpl-test',
+          model: 'gpt-4',
+          usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+        });
+      });
+
+      await new Promise((resolve) => { server = app.listen(0, resolve); });
+      const res = await request(server, '/test');
+      expect(res.status).toBe(200);
+
+      // Wait for setImmediate to fire
+      await wait(50);
+
+      expect(mockEmitter.emit).toHaveBeenCalledTimes(1);
+      const event = mockEmitter.emit.mock.calls[0][0];
+      expect(event.model).toBe('gpt-4');
+      expect(event.cost_usd).toBeGreaterThan(0);
+      expect(event.prompt_tokens).toBe(100);
+      expect(event.completion_tokens).toBe(50);
+    });
+
+    it('does NOT call emitter.emit for non-completion responses', async () => {
+      const mockEmitter = { emit: jest.fn().mockResolvedValue(true) };
+      const app = express();
+      app.use(createCostCapture(mockEmitter));
+      app.get('/health', (_req, res) => {
+        res.json({ status: 'ok' });
+      });
+
+      await new Promise((resolve) => { server = app.listen(0, resolve); });
+      await request(server, '/health');
+      await wait(50);
+
+      expect(mockEmitter.emit).not.toHaveBeenCalled();
+    });
+
+    it('still returns response when emitter fails (fail-open)', async () => {
+      const mockEmitter = { emit: jest.fn().mockRejectedValue(new Error('redis down')) };
+      const app = express();
+      app.use(createCostCapture(mockEmitter));
+      app.get('/test', (_req, res) => {
+        res.json({
+          model: 'gpt-4',
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        });
+      });
+
+      await new Promise((resolve) => { server = app.listen(0, resolve); });
+      const res = await request(server, '/test');
+      expect(res.status).toBe(200);
+      expect(res.body.model).toBe('gpt-4');
     });
   });
 });
