@@ -4,9 +4,10 @@
  * Validates the x-client-id header on all non-health routes.
  * - Missing header  → 401 + alert
  * - Invalid format  → 400 + alert
- * - Valid           → attaches req.clientId and continues
+ * - Valid           → attaches req.clientId (normalized to lowercase) and continues
  *
  * Valid client_id: UUID v4 format (hex + hyphens, case-insensitive).
+ * Stored lowercase on req.clientId for consistent downstream lookups.
  */
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -14,10 +15,11 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 // Max length for client_id header before we truncate in logs
 const MAX_CLIENT_ID_LOG_LEN = 128;
 
-// Paths exempt from client_id validation
+// Paths exempt from client_id validation (exact match + direct sub-paths only)
 const EXEMPT_PATHS = ['/health'];
 
 // In-memory alert counter (swap for real alerting integration later)
+// TODO: Add ceiling or periodic reset to prevent unbounded growth under sustained attack.
 const alertCounters = { missing: 0, invalid: 0 };
 
 function resetAlertCounters() {
@@ -69,14 +71,27 @@ function emitAlert(type, detail, req) {
   return alert;
 }
 
+/**
+ * Check if a request path is exempt from client_id validation.
+ * Uses resolved path to prevent traversal bypasses (e.g. /health/../admin).
+ */
+function isExemptPath(reqPath) {
+  // Resolve path traversals: normalize ../ and ./ segments
+  const { posix } = require('path');
+  const resolved = posix.normalize(reqPath);
+  return EXEMPT_PATHS.some((p) => resolved === p || resolved.startsWith(p + '/'));
+}
+
 function validateClientId(req, res, next) {
-  // Skip exempt paths (health, health sub-paths)
-  if (EXEMPT_PATHS.some((p) => req.path === p || req.path.startsWith(p + '/'))) {
+  // Skip exempt paths
+  if (isExemptPath(req.path)) {
     return next();
   }
 
   const clientId = req.headers['x-client-id'];
 
+  // Empty string is falsy — treated as missing per design.
+  // Rationale: an empty x-client-id header provides no identity, same as absent.
   if (!clientId) {
     alertCounters.missing++;
     const alert = emitAlert('missing_client_id', 'Request has no x-client-id header', req);
@@ -98,8 +113,9 @@ function validateClientId(req, res, next) {
     });
   }
 
-  req.clientId = clientId;
+  // Normalize to lowercase for consistent downstream lookups
+  req.clientId = clientId.toLowerCase();
   next();
 }
 
-module.exports = { validateClientId, getAlertCounters, resetAlertCounters, sanitizeForLog, UUID_RE, MAX_CLIENT_ID_LOG_LEN, EXEMPT_PATHS };
+module.exports = { validateClientId, getAlertCounters, resetAlertCounters, sanitizeForLog, isExemptPath, UUID_RE, MAX_CLIENT_ID_LOG_LEN, EXEMPT_PATHS };
