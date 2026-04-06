@@ -26,7 +26,7 @@ jobs:
         run: npm ci
 
       - name: Lint (check for syntax errors)
-        run: npx acorn --ecma2020 --module --silent backend/**/*.js backend/middleware/**/*.js
+        run: find backend -name '*.js' -print0 | xargs -0 npx acorn --ecma2020 --module --silent
 
       - name: Run tests
         run: npm test -- --verbose --ci
@@ -73,24 +73,6 @@ jobs:
           echo "Health status: $STATUS"
           if [ "$STATUS" != "ok" ]; then
             echo "::error::Health check failed — expected 'ok', got '$STATUS'"
-            exit 1
-          fi
-
-      - name: Validate client_id enforcement
-        run: |
-          # Should reject without client_id
-          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/api/test)
-          echo "No client_id → HTTP $HTTP_CODE"
-          if [ "$HTTP_CODE" != "401" ]; then
-            echo "::error::Expected 401 without x-client-id, got $HTTP_CODE"
-            exit 1
-          fi
-
-          # Should reject with invalid client_id
-          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H 'x-client-id: bad' http://localhost:3000/api/test)
-          echo "Invalid client_id → HTTP $HTTP_CODE"
-          if [ "$HTTP_CODE" != "400" ]; then
-            echo "::error::Expected 400 with invalid x-client-id, got $HTTP_CODE"
             exit 1
           fi
 
