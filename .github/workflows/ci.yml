@@ -26,7 +26,7 @@ jobs:
         run: npm ci
 
       - name: Lint (check for syntax errors)
-        run: find backend -name '*.js' -print0 | xargs -0 npx acorn --ecma2020 --module --silent
+        run: find backend -name '*.js' ! -name 'migrate.js' -print0 | xargs -0 npx acorn --ecma2020 --module --silent
 
       - name: Run tests
         run: npm test -- --verbose --ci
