@@ -170,7 +170,7 @@ function buildQuery(params) {
         SUM(total_prompt_tokens)::bigint AS prompt_tokens,
         SUM(total_completion_tokens)::bigint AS completion_tokens,
         SUM(total_tokens)::bigint AS total_tokens,
-        AVG(avg_latency_ms) AS avg_latency_ms,
+        SUM(avg_latency_ms * request_count) / NULLIF(SUM(request_count), 0) AS avg_latency_ms,
         SUM(error_count)::bigint AS error_count
       FROM cost_rollup_hourly
       WHERE client_id = $1

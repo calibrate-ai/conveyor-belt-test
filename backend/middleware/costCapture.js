@@ -71,6 +71,9 @@ function createCostCapture(emitter) {
     // Intercept res.json to capture the response body
     const originalJson = res.json.bind(res);
     res.json = function captureJson(body) {
+      // Capture latency before sending response for accurate measurement
+      const latencyMs = Date.now() - startTime;
+
       // Send the response immediately — never delay the client
       const result = originalJson(body);
 
@@ -79,8 +82,6 @@ function createCostCapture(emitter) {
         try {
           const usage = extractUsage(body);
           if (!usage) return; // Not a completion response, skip
-
-          const latencyMs = Date.now() - startTime;
           const costResult = calculateCost(usage.model, usage.promptTokens, usage.completionTokens);
           const event = buildEvent(req, res, usage, costResult, latencyMs);
 
