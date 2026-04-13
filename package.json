@@ -7,8 +7,18 @@
     "start": "node backend/server.js"
   },
   "devDependencies": {
+    "@babel/core": "^7.29.0",
+    "@babel/preset-env": "^7.29.2",
+    "@babel/preset-react": "^7.28.5",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "acorn": "^8.16.0",
-    "jest": "^29.0.0"
+    "babel-jest": "^30.3.0",
+    "jest": "^29.0.0",
+    "jest-environment-jsdom": "^30.3.0",
+    "prop-types": "^15.8.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
   },
   "dependencies": {
     "express": "^4.18.0",
