@@ -1,14 +1,20 @@
 /**
- * RabbitMQ consumer service — reads ai_events queue, writes to TimescaleDB.
+ * Redis consumer service — reads ai_events list via BLPOP, writes to TimescaleDB.
+ *
+ * Matches the publisher in PR #8 (eventEmitter.js) which uses ioredis.rpush()
+ * to publish to the ai_events Redis list.
  *
  * Design:
- * - Prefetch N messages, ack only AFTER successful DB write
- * - On DB write failure: nack with requeue=false → message goes to DLQ
+ * - BLPOP blocks until a message is available (with configurable timeout)
+ * - On successful DB write: message is consumed (BLPOP already removed it)
+ * - On DB write failure: push to DLQ list for later inspection
  * - Graceful shutdown on SIGTERM/SIGINT
- * - Reconnects on connection loss
+ *
+ * NOTE: Reconnection is handled by the process manager (systemd/k8s restart policy).
+ * The consumer exits on unrecoverable errors so the orchestrator can restart it.
  *
  * Usage:
- *   RABBITMQ_URL=amqp://... DB_PASSWORD=... node backend/consumer/consumer.js
+ *   REDIS_URL=redis://... DB_PASSWORD=... node backend/consumer/consumer.js
  */
 
 const { insertOne } = require('./writer');
@@ -17,9 +23,9 @@ const { insertOne } = require('./writer');
  * Parse and validate a queue message.
  * Returns the parsed event or null if invalid.
  */
-function parseMessage(msg) {
+function parseMessage(raw) {
   try {
-    const event = JSON.parse(msg.content.toString());
+    const event = JSON.parse(raw);
 
     // Minimum required fields
     if (!event.client_id || !event.model) {
@@ -39,13 +45,13 @@ function parseMessage(msg) {
 /**
  * Create the consumer.
  *
- * @param {object} channel — amqplib channel
+ * @param {object} redisClient — ioredis client with blpop/rpush
  * @param {object} dbPool — pg Pool
- * @param {object} opts — { queue, dlq, prefetch }
- * @returns {object} { start, stop, getStats }
+ * @param {object} opts — { queue, dlq, blockTimeoutSec }
+ * @returns {object} { start, stop, getStats, processOne }
  */
-function createConsumer(channel, dbPool, opts) {
-  const { queue, dlq, prefetch = 10 } = opts;
+function createConsumer(redisClient, dbPool, opts) {
+  const { queue, dlq, blockTimeoutSec = 5 } = opts;
 
   const stats = {
     processed: 0,
@@ -54,72 +60,76 @@ function createConsumer(channel, dbPool, opts) {
     dropped: 0,
   };
 
-  let consumerTag = null;
   let running = false;
 
-  async function setup() {
-    // Assert queues exist (idempotent)
-    await channel.assertQueue(queue, {
-      durable: true,
-      arguments: {
-        'x-dead-letter-exchange': '',
-        'x-dead-letter-routing-key': dlq,
-      },
-    });
-
-    await channel.assertQueue(dlq, { durable: true });
-
-    await channel.prefetch(prefetch);
-  }
-
-  async function handleMessage(msg) {
-    if (!msg) return; // Consumer cancelled
-
+  /**
+   * Process a single raw message string.
+   * Returns 'written' | 'failed' | 'dropped'.
+   */
+  async function processOne(raw) {
     stats.processed++;
-    const event = parseMessage(msg);
+    const event = parseMessage(raw);
 
     if (!event) {
-      // Unparseable message — ack to remove from queue (don't requeue garbage)
       stats.dropped++;
-      channel.ack(msg);
-      return;
+      return 'dropped';
     }
 
     try {
       await insertOne(dbPool, event);
       stats.written++;
-      channel.ack(msg);
+      return 'written';
     } catch (err) {
       stats.failed++;
-      console.error('[consumer] DB write failed, nacking to DLQ:', err.message);
-      // nack with requeue=false → goes to DLQ
-      channel.nack(msg, false, false);
+      console.error('[consumer] DB write failed, pushing to DLQ:', err.message);
+      try {
+        await redisClient.rpush(dlq, raw);
+      } catch (dlqErr) {
+        console.error('[consumer] Failed to push to DLQ:', dlqErr.message);
+      }
+      return 'failed';
     }
   }
 
+  /**
+   * Main consume loop — blocks on BLPOP until stopped.
+   */
   async function start() {
-    await setup();
     running = true;
-    const { consumerTag: tag } = await channel.consume(queue, handleMessage);
-    consumerTag = tag;
-    console.log(`[consumer] Consuming from ${queue} (prefetch=${prefetch})`);
-    return tag;
+    console.log(`[consumer] Consuming from Redis list "${queue}" (timeout=${blockTimeoutSec}s)`);
+
+    while (running) {
+      try {
+        // BLPOP returns [key, value] or null on timeout
+        const result = await redisClient.blpop(queue, blockTimeoutSec);
+        if (!result) continue; // timeout, loop back
+
+        const [, raw] = result;
+        await processOne(raw);
+      } catch (err) {
+        if (!running) break; // shutdown in progress
+        console.error('[consumer] Error in consume loop:', err.message);
+        // Brief pause before retrying to avoid tight error loop
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+
+    console.log('[consumer] Stopped consuming');
   }
 
-  async function stop() {
-    if (!running) return;
+  function stop() {
     running = false;
-    if (consumerTag) {
-      await channel.cancel(consumerTag);
-      console.log('[consumer] Stopped consuming');
-    }
   }
 
   function getStats() {
     return { ...stats };
   }
 
-  return { start, stop, getStats, handleMessage, setup };
+  function isRunning() {
+    return running;
+  }
+
+  return { start, stop, getStats, processOne, isRunning };
 }
 
 module.exports = { createConsumer, parseMessage };

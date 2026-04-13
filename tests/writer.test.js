@@ -1,4 +1,4 @@
-const { insertOne, insertBatch, buildInsertSql, INSERT_COLUMNS } = require('../backend/consumer/writer');
+const { insertOne, insertBatch, buildInsertSql, INSERT_COLUMNS, serializeMetadata } = require('../backend/consumer/writer');
 
 const VALID_EVENT = {
   ts: '2026-04-13T00:00:00.000Z',
@@ -26,6 +26,21 @@ describe('writer', () => {
     });
   });
 
+  describe('serializeMetadata', () => {
+    it('returns null for null/undefined', () => {
+      expect(serializeMetadata(null)).toBeNull();
+      expect(serializeMetadata(undefined)).toBeNull();
+    });
+
+    it('returns string as-is (no double serialization)', () => {
+      expect(serializeMetadata('{"key":"val"}')).toBe('{"key":"val"}');
+    });
+
+    it('serializes objects to JSON', () => {
+      expect(serializeMetadata({ key: 'val' })).toBe('{"key":"val"}');
+    });
+  });
+
   describe('buildInsertSql', () => {
     it('returns correct number of placeholders and values', () => {
       const { placeholders, values } = buildInsertSql(VALID_EVENT);
@@ -47,18 +62,22 @@ describe('writer', () => {
 
     it('defaults missing fields', () => {
       const { values } = buildInsertSql({ client_id: 'test', model: 'gpt-4' });
-      // provider defaults to 'unknown'
-      expect(values[3]).toBe('unknown');
-      // tokens default to 0
-      expect(values[4]).toBe(0);
-      expect(values[5]).toBe(0);
-      expect(values[6]).toBe(0);
+      expect(values[3]).toBe('unknown'); // provider
+      expect(values[4]).toBe(0); // prompt_tokens
+      expect(values[5]).toBe(0); // completion_tokens
+      expect(values[6]).toBe(0); // total_tokens
     });
 
-    it('serializes metadata to JSON string', () => {
+    it('serializes object metadata to JSON string', () => {
       const event = { ...VALID_EVENT, metadata: { key: 'value' } };
       const { values } = buildInsertSql(event);
       expect(values[12]).toBe('{"key":"value"}');
+    });
+
+    it('passes string metadata through without double-serialization', () => {
+      const event = { ...VALID_EVENT, metadata: '{"already":"json"}' };
+      const { values } = buildInsertSql(event);
+      expect(values[12]).toBe('{"already":"json"}');
     });
   });
 
@@ -81,15 +100,41 @@ describe('writer', () => {
   });
 
   describe('insertBatch', () => {
-    it('inserts multiple events in a single query', async () => {
-      const mockPool = { query: jest.fn().mockResolvedValue({ rowCount: 3 }) };
+    it('delegates to insertOne for single event', async () => {
+      const mockPool = { query: jest.fn().mockResolvedValue({ rowCount: 1 }) };
+      const count = await insertBatch(mockPool, [VALID_EVENT]);
+      expect(count).toBe(1);
+      expect(mockPool.query).toHaveBeenCalledTimes(1);
+    });
+
+    it('inserts multiple events in a transaction', async () => {
+      const mockClient = {
+        query: jest.fn().mockResolvedValue({ rowCount: 3 }),
+        release: jest.fn(),
+      };
+      const mockPool = { connect: jest.fn().mockResolvedValue(mockClient) };
       const events = [VALID_EVENT, VALID_EVENT, VALID_EVENT];
       const count = await insertBatch(mockPool, events);
       expect(count).toBe(3);
-      expect(mockPool.query).toHaveBeenCalledTimes(1);
-      const [sql, values] = mockPool.query.mock.calls[0];
-      expect(sql).toContain('INSERT INTO requests');
-      expect(values).toHaveLength(INSERT_COLUMNS.length * 3);
+      // BEGIN + INSERT + COMMIT = 3 calls
+      expect(mockClient.query).toHaveBeenCalledTimes(3);
+      expect(mockClient.query.mock.calls[0][0]).toBe('BEGIN');
+      expect(mockClient.query.mock.calls[2][0]).toBe('COMMIT');
+      expect(mockClient.release).toHaveBeenCalled();
+    });
+
+    it('rolls back on failure', async () => {
+      const mockClient = {
+        query: jest.fn()
+          .mockResolvedValueOnce(undefined) // BEGIN
+          .mockRejectedValueOnce(new Error('insert fail')) // INSERT
+          .mockResolvedValueOnce(undefined), // ROLLBACK
+        release: jest.fn(),
+      };
+      const mockPool = { connect: jest.fn().mockResolvedValue(mockClient) };
+      await expect(insertBatch(mockPool, [VALID_EVENT, VALID_EVENT])).rejects.toThrow('insert fail');
+      expect(mockClient.query).toHaveBeenCalledWith('ROLLBACK');
+      expect(mockClient.release).toHaveBeenCalled();
     });
 
     it('returns 0 for empty array', async () => {
@@ -100,10 +145,14 @@ describe('writer', () => {
     });
 
     it('uses correct parameter offsets for each row', async () => {
-      const mockPool = { query: jest.fn().mockResolvedValue({ rowCount: 2 }) };
+      const mockClient = {
+        query: jest.fn().mockResolvedValue({ rowCount: 2 }),
+        release: jest.fn(),
+      };
+      const mockPool = { connect: jest.fn().mockResolvedValue(mockClient) };
       await insertBatch(mockPool, [VALID_EVENT, VALID_EVENT]);
-      const [sql] = mockPool.query.mock.calls[0];
-      // First row: $1..$13, second row: $14..$26
+      const insertCall = mockClient.query.mock.calls[1];
+      const [sql] = insertCall;
       expect(sql).toContain('$1');
       expect(sql).toContain('$14');
       expect(sql).toContain('$26');

@@ -1,20 +1,23 @@
 /**
  * Consumer configuration — all from environment variables.
+ * DB config imported from shared module to avoid duplication.
  */
 
+const dbConfig = require('../db/config');
+
 module.exports = {
-  rabbitmq: {
-    url: process.env.RABBITMQ_URL || 'amqp://localhost:5672',
-    queue: process.env.RABBITMQ_QUEUE || 'ai_events',
-    dlq: process.env.RABBITMQ_DLQ || 'ai_events_dlq',
-    prefetch: parseInt(process.env.RABBITMQ_PREFETCH, 10) || 10,
-    reconnectDelayMs: parseInt(process.env.RABBITMQ_RECONNECT_DELAY, 10) || 5000,
+  redis: {
+    url: process.env.REDIS_URL || 'redis://localhost:6379',
+    queue: process.env.REDIS_QUEUE_NAME || 'ai_events',
+    dlq: process.env.REDIS_DLQ_NAME || 'ai_events_dlq',
+    // BLPOP timeout in seconds (0 = block forever)
+    blockTimeoutSec: parseInt(process.env.REDIS_BLOCK_TIMEOUT, 10) || 5,
   },
-  db: {
-    host: process.env.DB_HOST || 'localhost',
-    port: parseInt(process.env.DB_PORT, 10) || 5432,
-    database: process.env.DB_NAME || 'calibrate',
-    user: process.env.DB_USER || 'calibrate',
-    password: process.env.DB_PASSWORD, // required — no default
+  db: dbConfig,
+  consumer: {
+    // Max messages to accumulate before flushing as batch
+    batchSize: parseInt(process.env.CONSUMER_BATCH_SIZE, 10) || 1,
+    // Max ms to wait before flushing an incomplete batch
+    batchFlushMs: parseInt(process.env.CONSUMER_BATCH_FLUSH_MS, 10) || 1000,
   },
 };

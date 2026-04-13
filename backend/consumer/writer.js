@@ -2,7 +2,7 @@
  * TimescaleDB writer — inserts request events into the requests hypertable.
  *
  * Supports single and batch inserts. Batch mode uses a single multi-row
- * INSERT for throughput; single mode for correctness when batch fails.
+ * INSERT wrapped in a transaction for atomicity.
  */
 
 const INSERT_COLUMNS = [
@@ -13,7 +13,16 @@ const INSERT_COLUMNS = [
 ];
 
 /**
- * Build a single-row parameterized INSERT.
+ * Safely serialize metadata — avoids double-serialization if already a string.
+ */
+function serializeMetadata(metadata) {
+  if (!metadata) return null;
+  if (typeof metadata === 'string') return metadata;
+  return JSON.stringify(metadata);
+}
+
+/**
+ * Build a single-row parameterized INSERT values array.
  */
 function buildInsertSql(event, offset = 0) {
   const values = [
@@ -29,7 +38,7 @@ function buildInsertSql(event, offset = 0) {
     event.status_code || 200,
     event.error_code || null,
     event.request_hash || null,
-    event.metadata ? JSON.stringify(event.metadata) : null,
+    serializeMetadata(event.metadata),
   ];
 
   const placeholders = values.map((_, i) => `$${i + 1 + offset}`);
@@ -51,7 +60,9 @@ async function insertOne(dbPool, event) {
 }
 
 /**
- * Batch insert multiple events in a single multi-row INSERT.
+ * Batch insert multiple events in a single transaction with multi-row INSERT.
+ * Atomic: all or nothing.
+ *
  * @param {object} dbPool — pg Pool
  * @param {object[]} events — array of parsed events
  * @returns {Promise<number>} number of rows inserted
@@ -59,19 +70,36 @@ async function insertOne(dbPool, event) {
 async function insertBatch(dbPool, events) {
   if (events.length === 0) return 0;
 
-  const allValues = [];
-  const rowPlaceholders = [];
+  if (events.length === 1) {
+    await insertOne(dbPool, events[0]);
+    return 1;
+  }
 
-  events.forEach((event, rowIdx) => {
-    const offset = rowIdx * INSERT_COLUMNS.length;
-    const { placeholders, values } = buildInsertSql(event, offset);
-    rowPlaceholders.push(`(${placeholders.join(', ')})`);
-    allValues.push(...values);
-  });
+  const client = await dbPool.connect();
+  try {
+    await client.query('BEGIN');
 
-  const sql = `INSERT INTO requests (${INSERT_COLUMNS.join(', ')}) VALUES ${rowPlaceholders.join(', ')}`;
-  const result = await dbPool.query(sql, allValues);
-  return result.rowCount;
+    const allValues = [];
+    const rowPlaceholders = [];
+
+    events.forEach((event, rowIdx) => {
+      const offset = rowIdx * INSERT_COLUMNS.length;
+      const { placeholders, values } = buildInsertSql(event, offset);
+      rowPlaceholders.push(`(${placeholders.join(', ')})`);
+      allValues.push(...values);
+    });
+
+    const sql = `INSERT INTO requests (${INSERT_COLUMNS.join(', ')}) VALUES ${rowPlaceholders.join(', ')}`;
+    const result = await client.query(sql, allValues);
+
+    await client.query('COMMIT');
+    return result.rowCount;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
-module.exports = { insertOne, insertBatch, buildInsertSql, INSERT_COLUMNS };
+module.exports = { insertOne, insertBatch, buildInsertSql, INSERT_COLUMNS, serializeMetadata };
