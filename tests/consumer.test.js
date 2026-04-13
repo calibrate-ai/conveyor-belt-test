@@ -27,6 +27,9 @@ function createMockDbPool(success = true) {
   };
 }
 
+// Disable retries for most tests to keep them fast
+const NO_RETRY = { maxRetries: 0 };
+
 describe('consumer', () => {
   describe('parseMessage', () => {
     it('parses valid JSON string', () => {
@@ -57,7 +60,7 @@ describe('consumer', () => {
     it('processOne writes valid event to DB', async () => {
       const redis = createMockRedis();
       const dbPool = createMockDbPool(true);
-      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq' });
+      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq', retryOptions: NO_RETRY });
 
       const result = await consumer.processOne(JSON.stringify(VALID_EVENT));
       expect(result).toBe('written');
@@ -68,7 +71,7 @@ describe('consumer', () => {
     it('processOne pushes to DLQ on DB failure', async () => {
       const redis = createMockRedis();
       const dbPool = createMockDbPool(false);
-      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq' });
+      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq', retryOptions: NO_RETRY });
 
       const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
       const result = await consumer.processOne(JSON.stringify(VALID_EVENT));
@@ -82,7 +85,7 @@ describe('consumer', () => {
     it('processOne drops unparseable messages', async () => {
       const redis = createMockRedis();
       const dbPool = createMockDbPool();
-      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq' });
+      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq', retryOptions: NO_RETRY });
 
       const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
       const result = await consumer.processOne('not json');
@@ -97,7 +100,7 @@ describe('consumer', () => {
     it('processOne drops messages missing required fields', async () => {
       const redis = createMockRedis();
       const dbPool = createMockDbPool();
-      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq' });
+      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq', retryOptions: NO_RETRY });
 
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       const result = await consumer.processOne(JSON.stringify({ model: 'gpt-4' }));
@@ -105,6 +108,70 @@ describe('consumer', () => {
 
       expect(result).toBe('dropped');
       expect(consumer.getStats().dropped).toBe(1);
+    });
+
+    it('retries transient DB errors before DLQ', async () => {
+      const redis = createMockRedis();
+      const connErr = new Error('connect ECONNREFUSED');
+      connErr.code = '08006';
+      const dbPool = {
+        query: jest.fn()
+          .mockRejectedValueOnce(connErr)
+          .mockRejectedValueOnce(connErr)
+          .mockResolvedValue({ rowCount: 1 }),
+      };
+      const consumer = createConsumer(redis, dbPool, {
+        queue: 'q', dlq: 'dlq',
+        retryOptions: { maxRetries: 3, baseDelayMs: 10, jitterFactor: 0 },
+      });
+
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const result = await consumer.processOne(JSON.stringify(VALID_EVENT));
+      warnSpy.mockRestore();
+
+      expect(result).toBe('written');
+      expect(dbPool.query).toHaveBeenCalledTimes(3);
+      expect(consumer.getStats().retries).toBe(2);
+    });
+
+    it('sends to DLQ after all retries exhausted', async () => {
+      const redis = createMockRedis();
+      const connErr = new Error('connect ECONNREFUSED');
+      connErr.code = '08006';
+      const dbPool = { query: jest.fn().mockRejectedValue(connErr) };
+      const consumer = createConsumer(redis, dbPool, {
+        queue: 'q', dlq: 'dlq',
+        retryOptions: { maxRetries: 2, baseDelayMs: 10, jitterFactor: 0 },
+      });
+
+      const spies = [
+        jest.spyOn(console, 'warn').mockImplementation(() => {}),
+        jest.spyOn(console, 'error').mockImplementation(() => {}),
+      ];
+      const result = await consumer.processOne(JSON.stringify(VALID_EVENT));
+      spies.forEach((s) => s.mockRestore());
+
+      expect(result).toBe('failed');
+      expect(dbPool.query).toHaveBeenCalledTimes(3); // 1 + 2 retries
+      expect(redis.rpush).toHaveBeenCalledWith('dlq', expect.any(String));
+    });
+
+    it('does not retry non-retryable errors', async () => {
+      const redis = createMockRedis();
+      const constraintErr = new Error('unique violation');
+      constraintErr.code = '23505';
+      const dbPool = { query: jest.fn().mockRejectedValue(constraintErr) };
+      const consumer = createConsumer(redis, dbPool, {
+        queue: 'q', dlq: 'dlq',
+        retryOptions: { maxRetries: 3, baseDelayMs: 10 },
+      });
+
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const result = await consumer.processOne(JSON.stringify(VALID_EVENT));
+      errorSpy.mockRestore();
+
+      expect(result).toBe('failed');
+      expect(dbPool.query).toHaveBeenCalledTimes(1); // no retries
     });
 
     it('tracks stats correctly across multiple messages', async () => {
@@ -117,12 +184,12 @@ describe('consumer', () => {
           return Promise.resolve({ rowCount: 1 });
         }),
       };
-      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq' });
+      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq', retryOptions: NO_RETRY });
 
       const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-      await consumer.processOne(JSON.stringify(VALID_EVENT)); // success
-      await consumer.processOne(JSON.stringify(VALID_EVENT)); // fail
-      await consumer.processOne(JSON.stringify(VALID_EVENT)); // success
+      await consumer.processOne(JSON.stringify(VALID_EVENT));
+      await consumer.processOne(JSON.stringify(VALID_EVENT));
+      await consumer.processOne(JSON.stringify(VALID_EVENT));
       errorSpy.mockRestore();
 
       const stats = consumer.getStats();
@@ -144,13 +211,12 @@ describe('consumer', () => {
         rpush: jest.fn().mockRejectedValue(new Error('DLQ error')),
       };
       const dbPool = createMockDbPool(false);
-      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq' });
+      const consumer = createConsumer(redis, dbPool, { queue: 'q', dlq: 'dlq', retryOptions: NO_RETRY });
 
       const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
       const result = await consumer.processOne(JSON.stringify(VALID_EVENT));
       errorSpy.mockRestore();
 
-      // Should still return 'failed' even if DLQ push also fails
       expect(result).toBe('failed');
       expect(consumer.getStats().failed).toBe(1);
     });
