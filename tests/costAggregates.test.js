@@ -207,6 +207,28 @@ describe('costAggregates query builder', () => {
       expect(sql).toMatch(/request_count/);
     });
 
+    it('uses weighted average for avg_latency_ms in day/week re-bucketing', () => {
+      const { sql } = buildQuery({ ...baseParams, granularity: 'day' });
+      // Must NOT use AVG(avg_latency_ms) — that's average-of-averages
+      expect(sql).not.toMatch(/AVG\(avg_latency_ms\)/);
+      // Must use weighted average: SUM(avg_latency_ms * request_count) / NULLIF(SUM(request_count), 0)
+      expect(sql).toContain('SUM(avg_latency_ms * request_count)');
+      expect(sql).toContain('NULLIF(SUM(request_count), 0)');
+    });
+
+    it('uses weighted average for week granularity too', () => {
+      const { sql } = buildQuery({ ...baseParams, granularity: 'week' });
+      expect(sql).not.toMatch(/AVG\(avg_latency_ms\)/);
+      expect(sql).toContain('SUM(avg_latency_ms * request_count)');
+    });
+
+    it('hour granularity reads avg_latency_ms directly (no re-bucketing)', () => {
+      const { sql } = buildQuery(baseParams);
+      // Hour reads directly from continuous aggregate, no SUM needed
+      expect(sql).toContain('avg_latency_ms');
+      expect(sql).not.toContain('SUM(avg_latency_ms');
+    });
+
     it('uses parameterized values (no SQL injection)', () => {
       const malicious = {
         ...baseParams,

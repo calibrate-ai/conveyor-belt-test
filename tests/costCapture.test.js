@@ -187,6 +187,32 @@ describe('costCapture middleware', () => {
       expect(mockEmitter.emit).not.toHaveBeenCalled();
     });
 
+    it('captures latency before sending response (not after event loop delay)', async () => {
+      const mockEmitter = { emit: jest.fn().mockResolvedValue(true) };
+      const app = express();
+      app.use(createCostCapture(mockEmitter));
+      app.get('/test', (_req, res) => {
+        // Simulate some processing time
+        const start = Date.now();
+        while (Date.now() - start < 20) { /* busy wait ~20ms */ }
+        res.json({
+          model: 'gpt-4',
+          usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+        });
+      });
+
+      await new Promise((resolve) => { server = app.listen(0, resolve); });
+      await request(server, '/test');
+      await wait(50);
+
+      expect(mockEmitter.emit).toHaveBeenCalledTimes(1);
+      const event = mockEmitter.emit.mock.calls[0][0];
+      // Latency should reflect request processing time (~20ms+), not event loop overhead
+      expect(event.latency_ms).toBeGreaterThanOrEqual(15);
+      // Should not include the 50ms wait time from setImmediate delay
+      expect(event.latency_ms).toBeLessThan(100);
+    });
+
     it('still returns response when emitter fails (fail-open)', async () => {
       const mockEmitter = { emit: jest.fn().mockRejectedValue(new Error('redis down')) };
       const app = express();
