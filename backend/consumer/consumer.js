@@ -6,8 +6,8 @@
  *
  * Design:
  * - BLPOP blocks until a message is available (with configurable timeout)
- * - On successful DB write: message is consumed (BLPOP already removed it)
- * - On DB write failure: push to DLQ list for later inspection
+ * - On DB write failure: retries with exponential backoff (configurable)
+ * - After max retries exhausted: push to DLQ list for later inspection
  * - Graceful shutdown on SIGTERM/SIGINT
  *
  * NOTE: Reconnection is handled by the process manager (systemd/k8s restart policy).
@@ -18,6 +18,7 @@
  */
 
 const { insertOne } = require('./writer');
+const { withRetry } = require('./retry');
 
 /**
  * Parse and validate a queue message.
@@ -47,23 +48,25 @@ function parseMessage(raw) {
  *
  * @param {object} redisClient — ioredis client with blpop/rpush
  * @param {object} dbPool — pg Pool
- * @param {object} opts — { queue, dlq, blockTimeoutSec }
- * @returns {object} { start, stop, getStats, processOne }
+ * @param {object} opts — { queue, dlq, blockTimeoutSec, retryOptions }
+ * @returns {object} { start, stop, getStats, processOne, isRunning }
  */
 function createConsumer(redisClient, dbPool, opts) {
-  const { queue, dlq, blockTimeoutSec = 5 } = opts;
+  const { queue, dlq, blockTimeoutSec = 5, retryOptions = {} } = opts;
 
   const stats = {
     processed: 0,
     written: 0,
     failed: 0,
     dropped: 0,
+    retries: 0,
   };
 
   let running = false;
 
   /**
    * Process a single raw message string.
+   * Retries transient DB failures with exponential backoff before DLQ.
    * Returns 'written' | 'failed' | 'dropped'.
    */
   async function processOne(raw) {
@@ -75,20 +78,29 @@ function createConsumer(redisClient, dbPool, opts) {
       return 'dropped';
     }
 
-    try {
-      await insertOne(dbPool, event);
+    const { success, error, attempts } = await withRetry(
+      () => insertOne(dbPool, event),
+      retryOptions,
+    );
+
+    if (attempts > 1) {
+      stats.retries += attempts - 1;
+    }
+
+    if (success) {
       stats.written++;
       return 'written';
-    } catch (err) {
-      stats.failed++;
-      console.error('[consumer] DB write failed, pushing to DLQ:', err.message);
-      try {
-        await redisClient.rpush(dlq, raw);
-      } catch (dlqErr) {
-        console.error('[consumer] Failed to push to DLQ:', dlqErr.message);
-      }
-      return 'failed';
     }
+
+    // All retries exhausted — push to DLQ
+    stats.failed++;
+    console.error(`[consumer] DB write failed after ${attempts} attempt(s), pushing to DLQ:`, error.message);
+    try {
+      await redisClient.rpush(dlq, raw);
+    } catch (dlqErr) {
+      console.error('[consumer] Failed to push to DLQ:', dlqErr.message);
+    }
+    return 'failed';
   }
 
   /**
