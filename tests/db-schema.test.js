@@ -164,6 +164,46 @@ describe('Database schema migrations', () => {
     });
   });
 
+  describe('003_compression_policy.sql', () => {
+    let sql;
+
+    beforeAll(() => {
+      sql = fs.readFileSync(path.join(MIGRATIONS_DIR, '003_compression_policy.sql'), 'utf8');
+    });
+
+    it('enables compression on the requests table', () => {
+      expect(sql).toMatch(/ALTER TABLE requests SET/i);
+      expect(sql).toMatch(/timescaledb\.compress/i);
+    });
+
+    it('segments by client_id for tenant-scoped queries', () => {
+      expect(sql).toMatch(/compress_segmentby.*client_id/i);
+    });
+
+    it('orders by ts DESC for time-range queries', () => {
+      expect(sql).toMatch(/compress_orderby.*ts DESC/i);
+    });
+
+    it('adds compression policy for chunks older than 7 days', () => {
+      expect(sql).toMatch(/add_compression_policy/i);
+      expect(sql).toMatch(/7 days/i);
+    });
+
+    it('uses if_not_exists for idempotency', () => {
+      expect(sql).toMatch(/if_not_exists/i);
+    });
+
+    it('wraps in a transaction', () => {
+      expect(sql).toMatch(/^BEGIN;/m);
+      expect(sql).toMatch(/^COMMIT;/m);
+    });
+
+    it('documents manual compress/decompress commands', () => {
+      expect(sql).toMatch(/compress_chunk/i);
+      expect(sql).toMatch(/decompress_chunk/i);
+    });
+  });
+
   describe('db/config.js', () => {
     it('reads from environment variables', () => {
       expect(dbConfig.host).toBeDefined();

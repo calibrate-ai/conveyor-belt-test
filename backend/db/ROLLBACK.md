@@ -4,6 +4,19 @@ Rollbacks are manual. The migration runner only supports forward migrations.
 
 ## Rolling Back Migrations
 
+### 003_compression_policy.sql
+
+```sql
+-- Remove compression policy
+SELECT remove_compression_policy('requests', if_not_exists => TRUE);
+-- Decompress all compressed chunks (may take time for large datasets)
+SELECT decompress_chunk(c) FROM show_chunks('requests', older_than => INTERVAL '7 days') c;
+-- Disable compression on the table
+ALTER TABLE requests SET (timescaledb.compress = false);
+-- Remove tracking entry
+DELETE FROM _migrations WHERE name = '003_compression_policy.sql';
+```
+
 ### 002_create_cost_rollup_view.sql
 
 ```sql
